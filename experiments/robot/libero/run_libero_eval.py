@@ -2,23 +2,11 @@
 run_libero_eval.py
 
 Runs a model in a LIBERO simulation environment.
-
-Usage:
-    # OpenVLA:
-    # IMPORTANT: Set `center_crop=True` if model is fine-tuned with augmentations
-    python experiments/robot/libero/run_libero_eval.py \
-        --model_family openvla \
-        --pretrained_checkpoint <CHECKPOINT_PATH> \
-        --task_suite_name [ libero_spatial | libero_object | libero_goal | libero_10 | libero_90 ] \
-        --center_crop [ True | False ] \
-        --run_id_note <OPTIONAL TAG TO INSERT INTO RUN ID FOR LOGGING> \
-        --use_wandb [ True | False ] \
-        --wandb_project <PROJECT> \
-        --wandb_entity <ENTITY>
 """
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -26,6 +14,7 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
+import torch
 from libero.libero import benchmark
 
 import wandb
@@ -50,42 +39,83 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 
+# Custom Profiler Module
+from vla_hardware_profiler import H100VLAProfiler  # <--- [PROFILER MOD 1]
+
 
 @dataclass
 class GenerateConfig:
-    # fmt: off
-
-    #################################################################################################################
     # Model-specific parameters
-    #################################################################################################################
-    model_family: str = "openvla"                    # Model family
-    pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
-    load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
-    load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
+    model_family: str = "openvla"
+    pretrained_checkpoint: Union[str, Path] = ""
+    load_in_8bit: bool = False
+    load_in_4bit: bool = False
+    center_crop: bool = True
 
-    center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
-
-    #################################################################################################################
     # LIBERO environment-specific parameters
-    #################################################################################################################
-    task_suite_name: str = "libero_spatial"          # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
-    num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
-    num_trials_per_task: int = 50                    # Number of rollouts per task
+    task_suite_name: str = "libero_spatial"
+    num_steps_wait: int = 10
+    num_trials_per_task: int = 50
 
-    #################################################################################################################
     # Utils
-    #################################################################################################################
-    run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
-    local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    run_id_note: Optional[str] = None
+    local_log_dir: str = "./experiments/logs"
+    use_wandb: bool = False
+    wandb_project: str = "YOUR_WANDB_PROJECT"
+    wandb_entity: str = "YOUR_WANDB_ENTITY"
+    seed: int = 7
 
-    use_wandb: bool = False                          # Whether to also log results in Weights & Biases
-    wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
-    wandb_entity: str = "YOUR_WANDB_ENTITY"          # Name of entity to log under
 
-    seed: int = 7                                    # Random Seed (for reproducibility)
+class PhaseSweepAnalyzer:
+    def __init__(self, log_filename="phase_sweep_results.log"):
+        self.temporal_metrics = []
+        self.structural_metrics = {}
+        self.log_filename = log_filename
 
-    # fmt: on
+    def log_temporal(self, duration_ms):
+        self.temporal_metrics.append(duration_ms)
 
+    def print_results(self):
+        output_lines = []
+        output_lines.append("\n" + "="*70)
+        output_lines.append(" PHASE-ADAPTIVE SWEEP RESULTS: PEAK-TO-MEAN RATIO ANALYSIS ")
+        output_lines.append("="*70)
+        
+        # 1. Temporal Phase Results
+        if self.temporal_metrics:
+            t_vals = np.array(self.temporal_metrics)
+            t_peak = np.max(t_vals)
+            t_mean = np.mean(t_vals)
+            t_p2m = t_peak / t_mean if t_mean > 0 else 1.0
+            output_lines.append(
+                f"[Temporal Windows]   Peak: {t_peak:6.2f}ms | Mean: {t_mean:6.2f}ms | Peak-to-Mean: {t_p2m:4.2f}x"
+            )
+
+        # 2. Structural Hook Results
+        if self.structural_metrics:
+            output_lines.append("-" * 70)
+            output_lines.append(f"{'Layer Name':<40} | {'Peak Entropy':<12} | {'Mean Entropy':<12} | {'P-to-M Ratio':<10}")
+            output_lines.append("-" * 70)
+            for name, entropies in self.structural_metrics.items():
+                s_vals = np.array(entropies)
+                s_peak = np.max(s_vals)
+                s_mean = np.mean(s_vals)
+                s_p2m = s_peak / s_mean if s_mean > 0 else 1.0
+                output_lines.append(f"{name[:40]:<40} | {s_peak:12.2f} | {s_mean:12.2f} | {s_p2m:9.2f}x")
+        output_lines.append("="*70 + "\n")
+
+        # Join output
+        report = "\n".join(output_lines)
+
+        # Print to stdout
+        print(report)
+
+        # Save to log file
+        with open(self.log_filename, "a") as f:
+            f.write(report)
+        print(f"[PhaseSweepAnalyzer] Results logged to {os.path.abspath(self.log_filename)}")
+
+sweep_analyzer = PhaseSweepAnalyzer()
 
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
@@ -103,11 +133,31 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Load model
     model = get_model(cfg)
 
+    def make_entropy_hook(layer_name):
+        def hook(module, input, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+        
+            if isinstance(tensor, torch.Tensor):
+                with torch.no_grad():
+                    t = tensor.detach().float()
+                    act_norm = torch.norm(t, dim=1)
+                    if act_norm.sum() < 1e-5:
+                        return
+
+                    probs = torch.softmax(act_norm, dim=0)
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-7)).mean()
+                    if layer_name not in sweep_analyzer.structural_metrics:
+                        sweep_analyzer.structural_metrics[layer_name] = []
+                    sweep_analyzer.structural_metrics[layer_name].append(entropy)
+        return hook
+
+    for name, module in model.named_modules():
+        if "layers" in name or "block" in name or "backbone" in name:
+            if name.endswith("0") or name.endswith("layer"): # Avoid over-hooking every single submodule
+                module.register_forward_hook(make_entropy_hook(name))			
+
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
-        # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
-        # with the suffix "_no_noops" in the dataset name)
-        print(f"Loaded Norm Stats Keys: {model.norm_stats.keys()}")
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
         assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
@@ -125,6 +175,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
     local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
+
+    # <--- [PROFILER MOD 2]: Instantiate Profiler ---
+    profiler_log_dir = os.path.join(cfg.local_log_dir, "h100_profile")
+    profiler = H100VLAProfiler(log_dir=profiler_log_dir)
+    profiler.start_torch_profiler(warmup_steps=3, active_steps=10)
+    # -----------------------------------------------
 
     # Initialize Weights & Biases logging as well
     if cfg.use_wandb:
@@ -147,68 +203,57 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
-        # Get task
         task = task_suite.get_task(task_id)
-
-        # Get default LIBERO initial states
         initial_states = task_suite.get_task_init_states(task_id)
-
-        # Initialize LIBERO environment and task description
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
 
-        # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
 
-            # Reset environment
             env.reset()
-
-            # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 
-            # Setup
             t = 0
             replay_images = []
             if cfg.task_suite_name == "libero_spatial":
-                max_steps = 220  # longest training demo has 193 steps
+                max_steps = 220
             elif cfg.task_suite_name == "libero_object":
-                max_steps = 280  # longest training demo has 254 steps
+                max_steps = 280
             elif cfg.task_suite_name == "libero_goal":
-                max_steps = 300  # longest training demo has 270 steps
+                max_steps = 300
             elif cfg.task_suite_name == "libero_10":
-                max_steps = 520  # longest training demo has 505 steps
+                max_steps = 520
             elif cfg.task_suite_name == "libero_90":
-                max_steps = 400  # longest training demo has 373 steps
+                max_steps = 400
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
+            
             while t < max_steps + cfg.num_steps_wait:
                 try:
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
+                    # <--- [PROFILER MOD 3]: Wrap Step & Measure Bottlenecks ---
+                    t0 = time.perf_counter()
+
                     if t < cfg.num_steps_wait:
                         obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
                         t += 1
+                        profiler.step()
                         continue
 
-                    # Get preprocessed image
+                    # 1. Preprocessing (CPU)
                     img = get_libero_image(obs, resize_size)
-
-                    # Save preprocessed image for replay video
                     replay_images.append(img)
-
-                    # Prepare observations dict
-                    # Note: OpenVLA does not take proprio state as input
                     observation = {
                         "full_image": img,
                         "state": np.concatenate(
                             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                         ),
                     }
+                    t1 = time.perf_counter()
 
-                    # Query model to get action
+                    # 2. VLA Inference (H100 GPU)
                     action = get_action(
                         cfg,
                         model,
@@ -216,17 +261,39 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         processor=processor,
                     )
-
-                    # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
-
-                    # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
-                    # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
                     if cfg.model_family == "openvla":
                         action = invert_gripper_action(action)
+                    
+                    # Force stream sync so CPU timer reflects exact CUDA runtime
+                    torch.cuda.synchronize()
+                    t2 = time.perf_counter()
 
-                    # Execute action in environment
+                    # 3. Environment Step (MuJoCo / EGL)
                     obs, reward, done, info = env.step(action.tolist())
+                    torch.cuda.synchronize()
+                    t3 = time.perf_counter()
+                    
+                    step_duration_ms = (time.perf_counter() - t1) * 1000.0
+
+                    sweep_analyzer.log_temporal(step_duration_ms)
+
+                    # Hardware Metrics Log
+                    hw_stats = profiler.sample_nvml_metrics()
+                    if t % 20 == 0:
+                        log_line = (
+                            f"[Step {t:03d}] Preproc: {(t1 - t0)*1000:.2f}ms | "
+                            f"VLA Forward: {(t2 - t1)*1000:.2f}ms | "
+                            f"MuJoCo Step: {(t3 - t2)*1000:.2f}ms | "
+                            f"VRAM: {hw_stats['vram_used_gb']:.1f}/{hw_stats['vram_total_gb']:.1f} GB | "
+                            f"Power: {hw_stats['power_draw_w']:.0f}W"
+                        )
+                        print(log_line)
+                        log_file.write(log_line + "\n")
+
+                    profiler.step()
+                    # ------------------------------------------------------------
+
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -241,12 +308,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
             save_rollout_video(
                 replay_images, total_episodes, success=done, task_description=task_description, log_file=log_file
             )
 
-            # Log current results
             print(f"Success: {done}")
             print(f"# episodes completed so far: {total_episodes}")
             print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
@@ -255,7 +320,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.write(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)\n")
             log_file.flush()
 
-        # Log final results
         print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
@@ -269,10 +333,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 }
             )
 
-    # Save local log file
+    # <--- [PROFILER MOD 4]: Flush and Clean Up ---
+    sweep_analyzer.print_results()
+    profiler.stop()
+    profiler.close()
+    print(f"H100 Profiler traces saved to: {profiler_log_dir}")
+    # -----------------------------------------------
+
     log_file.close()
 
-    # Push total metrics and local log file to wandb
     if cfg.use_wandb:
         wandb.log(
             {
